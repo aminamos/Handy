@@ -431,7 +431,21 @@
       "retranscribe": "Re-transcribe",
       "retranscribeError": "Failed to re-transcribe. Please try again.",
       "transcribing": "Transcribing...",
-      "transcriptionFailed": "Transcription failed. You can re-transcribe using the retry icon."
+      "transcriptionFailed": "Transcription failed. You can re-transcribe using the retry icon.",
+      "metrics": {
+        "title": "Usage Metrics",
+        "description": "Track how many words you dictate each day and week.",
+        "loading": "Refreshing...",
+        "today": "Today",
+        "thisWeek": "This Week",
+        "total": "Total Words",
+        "recentWeeks": "Recent Weekly Totals",
+        "recentDays": "Recent Daily Totals",
+        "consistency": "Consistency",
+        "less": "Less",
+        "more": "More",
+        "dayTooltip": "{{date}}: {{count}} words"
+      }
     },
     "debug": {
       "title": "Debug",

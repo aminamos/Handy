@@ -1,10 +1,11 @@
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Utc};
 use log::{debug, error, info};
 use rusqlite::{params, Connection, OptionalExtension};
 use rusqlite_migration::{Migrations, M};
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use tauri::AppHandle;
@@ -64,6 +65,31 @@ pub struct HistoryEntry {
     pub post_process_prompt: Option<String>,
     pub post_process_requested: bool,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, Type)]
+pub struct DailyWordCount {
+    pub date: String,
+    pub words: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Type)]
+pub struct WeeklyWordCount {
+    pub week_start: String,
+    pub words: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Type)]
+pub struct HistoryUsageStats {
+    pub today: String,
+    pub total_words: usize,
+    pub today_words: usize,
+    pub this_week_words: usize,
+    pub daily_word_counts: Vec<DailyWordCount>,
+    pub weekly_word_counts: Vec<WeeklyWordCount>,
+}
+
+const HEATMAP_WEEKS: usize = 53;
+const RECENT_WEEKS: usize = 8;
 
 pub struct HistoryManager {
     app_handle: AppHandle,
@@ -208,6 +234,77 @@ impl HistoryManager {
             post_process_prompt: row.get("post_process_prompt")?,
             post_process_requested: row.get("post_process_requested")?,
         })
+    }
+
+    fn count_words(text: &str) -> usize {
+        text.split_whitespace().count()
+    }
+
+    fn start_of_week(date: NaiveDate) -> NaiveDate {
+        date - Duration::days(i64::from(date.weekday().num_days_from_monday()))
+    }
+
+    fn date_key(date: NaiveDate) -> String {
+        date.format("%Y-%m-%d").to_string()
+    }
+
+    fn add_word_count(
+        daily_word_totals: &mut BTreeMap<NaiveDate, usize>,
+        total_words: &mut usize,
+        date: NaiveDate,
+        text: &str,
+    ) {
+        let word_count = Self::count_words(text);
+        if word_count == 0 {
+            return;
+        }
+
+        *total_words += word_count;
+        *daily_word_totals.entry(date).or_default() += word_count;
+    }
+
+    fn build_usage_stats(
+        daily_word_totals: &BTreeMap<NaiveDate, usize>,
+        total_words: usize,
+        today: NaiveDate,
+    ) -> HistoryUsageStats {
+        let current_week_start = Self::start_of_week(today);
+        let heatmap_start = current_week_start - Duration::weeks((HEATMAP_WEEKS - 1) as i64);
+        let recent_week_start = current_week_start - Duration::weeks((RECENT_WEEKS - 1) as i64);
+
+        let today_words = daily_word_totals.get(&today).copied().unwrap_or_default();
+        let this_week_words = (0..7)
+            .map(|offset| current_week_start + Duration::days(offset))
+            .map(|date| daily_word_totals.get(&date).copied().unwrap_or_default())
+            .sum();
+
+        let daily_word_counts = (0..(HEATMAP_WEEKS * 7))
+            .map(|offset| heatmap_start + Duration::days(offset as i64))
+            .map(|date| DailyWordCount {
+                date: Self::date_key(date),
+                words: daily_word_totals.get(&date).copied().unwrap_or_default(),
+            })
+            .collect();
+
+        let weekly_word_counts = (0..RECENT_WEEKS)
+            .map(|offset| recent_week_start + Duration::weeks(offset as i64))
+            .map(|week_start| WeeklyWordCount {
+                week_start: Self::date_key(week_start),
+                words: (0..7)
+                    .map(|day_offset| week_start + Duration::days(day_offset))
+                    .map(|date| daily_word_totals.get(&date).copied().unwrap_or_default())
+                    .sum(),
+            })
+            .collect();
+
+        HistoryUsageStats {
+            today: Self::date_key(today),
+            total_words,
+            today_words,
+            this_week_words,
+            daily_word_counts,
+            weekly_word_counts,
+        }
     }
 
     pub fn recordings_dir(&self) -> &std::path::Path {
@@ -504,6 +601,43 @@ impl HistoryManager {
         Ok(PaginatedHistory { entries, has_more })
     }
 
+    pub async fn get_usage_stats(&self) -> Result<HistoryUsageStats> {
+        let conn = self.get_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT timestamp, transcription_text, post_processed_text
+             FROM transcription_history",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>("timestamp")?,
+                row.get::<_, String>("transcription_text")?,
+                row.get::<_, Option<String>>("post_processed_text")?,
+            ))
+        })?;
+
+        let mut daily_word_totals = BTreeMap::new();
+        let mut total_words = 0;
+
+        for row in rows {
+            let (timestamp, transcription_text, post_processed_text) = row?;
+            let Some(utc_datetime) = DateTime::from_timestamp(timestamp, 0) else {
+                debug!("Skipping history entry with invalid timestamp: {}", timestamp);
+                continue;
+            };
+
+            let local_date = utc_datetime.with_timezone(&Local).date_naive();
+            let text = post_processed_text.as_deref().unwrap_or(&transcription_text);
+            Self::add_word_count(&mut daily_word_totals, &mut total_words, local_date, text);
+        }
+
+        Ok(Self::build_usage_stats(
+            &daily_word_totals,
+            total_words,
+            Local::now().date_naive(),
+        ))
+    }
+
     #[cfg(test)]
     fn get_latest_entry_with_conn(conn: &Connection) -> Result<Option<HistoryEntry>> {
         let mut stmt = conn.prepare(
@@ -697,6 +831,89 @@ mod tests {
             ],
         )
         .expect("insert history entry");
+    }
+
+    fn date(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).expect("valid date")
+    }
+
+    fn daily_counts(entries: &[(NaiveDate, usize)]) -> BTreeMap<NaiveDate, usize> {
+        entries.iter().copied().collect()
+    }
+
+    #[test]
+    fn build_usage_stats_returns_zero_filled_chart() {
+        let today = date(2026, 5, 31);
+        let stats = HistoryManager::build_usage_stats(&BTreeMap::new(), 0, today);
+        assert_eq!(stats.today, "2026-05-31");
+
+        assert_eq!(stats.total_words, 0);
+        assert_eq!(stats.today_words, 0);
+        assert_eq!(stats.this_week_words, 0);
+        assert_eq!(stats.daily_word_counts.len(), HEATMAP_WEEKS * 7);
+        assert_eq!(stats.weekly_word_counts.len(), RECENT_WEEKS);
+        assert_eq!(
+            stats.daily_word_counts.first().map(|day| day.date.as_str()),
+            Some("2025-05-26")
+        );
+        assert_eq!(
+            stats.weekly_word_counts.last().map(|week| week.week_start.as_str()),
+            Some("2026-05-25")
+        );
+    }
+
+    #[test]
+    fn build_usage_stats_aggregates_days_and_weeks() {
+        let today = date(2026, 5, 31);
+        let daily_word_totals = daily_counts(&[
+            (date(2026, 5, 31), 5),
+            (date(2026, 5, 29), 7),
+            (date(2026, 5, 26), 3),
+            (date(2026, 5, 18), 11),
+        ]);
+
+        let stats = HistoryManager::build_usage_stats(&daily_word_totals, 26, today);
+
+        assert_eq!(stats.today, "2026-05-31");
+        assert_eq!(stats.total_words, 26);
+        assert_eq!(stats.today_words, 5);
+        assert_eq!(stats.this_week_words, 15);
+
+        let current_week = stats
+            .weekly_word_counts
+            .iter()
+            .find(|week| week.week_start == "2026-05-25")
+            .expect("current week present");
+        assert_eq!(current_week.words, 15);
+
+        let previous_week = stats
+            .weekly_word_counts
+            .iter()
+            .find(|week| week.week_start == "2026-05-18")
+            .expect("previous week present");
+        assert_eq!(previous_week.words, 11);
+
+        let today_entry = stats
+            .daily_word_counts
+            .iter()
+            .find(|day| day.date == "2026-05-31")
+            .expect("today present");
+        assert_eq!(today_entry.words, 5);
+    }
+
+    #[test]
+    fn add_word_count_uses_processed_text_word_boundaries() {
+        let mut daily_word_totals = BTreeMap::new();
+        let mut total_words = 0;
+
+        HistoryManager::add_word_count(
+            &mut daily_word_totals,
+            &mut total_words,
+            date(2026, 5, 31),
+            "  polished output with four words  ",
+        );
+        assert_eq!(total_words, 5);
+        assert_eq!(daily_word_totals.get(&date(2026, 5, 31)).copied(), Some(5));
     }
 
     #[test]

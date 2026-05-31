@@ -9,9 +9,11 @@ import {
   events,
   type HistoryEntry,
   type HistoryUpdatePayload,
+  type HistoryUsageStats,
 } from "@/bindings";
 import { useOsType } from "@/hooks/useOsType";
 import { formatDateTime } from "@/utils/dateFormat";
+import { HistoryUsageStatsPanel } from "./HistoryUsageStats";
 import { AudioPlayer } from "../../ui/AudioPlayer";
 import { Button } from "../../ui/Button";
 
@@ -63,7 +65,9 @@ export const HistorySettings: React.FC = () => {
   const { t } = useTranslation();
   const osType = useOsType();
   const [entries, setEntries] = useState<HistoryEntry[]>([]);
+  const [usageStats, setUsageStats] = useState<HistoryUsageStats | null>(null);
   const [loading, setLoading] = useState(true);
+  const [statsLoading, setStatsLoading] = useState(true);
   const [hasMore, setHasMore] = useState(true);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const entriesRef = useRef<HistoryEntry[]>([]);
@@ -101,10 +105,30 @@ export const HistorySettings: React.FC = () => {
     }
   }, []);
 
+  const loadUsageStats = useCallback(async (showLoading = false) => {
+    if (showLoading) {
+      setStatsLoading(true);
+    }
+
+    try {
+      const result = await commands.getHistoryUsageStats();
+      if (result.status === "ok") {
+        setUsageStats(result.data);
+      }
+    } catch (error) {
+      console.error("Failed to load usage stats:", error);
+    } finally {
+      if (showLoading) {
+        setStatsLoading(false);
+      }
+    }
+  }, []);
+
   // Initial load
   useEffect(() => {
     loadPage();
-  }, [loadPage]);
+    loadUsageStats(true);
+  }, [loadPage, loadUsageStats]);
 
   // Infinite scroll via IntersectionObserver
   useEffect(() => {
@@ -130,25 +154,28 @@ export const HistorySettings: React.FC = () => {
     return () => observer.disconnect();
   }, [loading, hasMore, loadPage]);
 
-  // Listen for new entries added from the transcription pipeline
+  // Listen for history changes from the transcription pipeline
   useEffect(() => {
     const unlisten = events.historyUpdatePayload.listen((event) => {
       const payload: HistoryUpdatePayload = event.payload;
       if (payload.action === "added") {
         setEntries((prev) => [payload.entry, ...prev]);
+        void loadUsageStats();
       } else if (payload.action === "updated") {
         setEntries((prev) =>
           prev.map((e) => (e.id === payload.entry.id ? payload.entry : e)),
         );
+        void loadUsageStats();
+      } else if (payload.action === "deleted") {
+        void loadUsageStats();
       }
-      // "deleted" and "toggled" are handled by optimistic updates only,
-      // so we intentionally ignore them here to avoid double-mutation.
+      // "toggled" does not affect word-count stats.
     });
 
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, []);
+  }, [loadUsageStats]);
 
   const toggleSaved = async (id: number) => {
     // Optimistic update
@@ -272,6 +299,7 @@ export const HistorySettings: React.FC = () => {
 
   return (
     <div className="max-w-3xl w-full mx-auto space-y-6">
+      <HistoryUsageStatsPanel stats={usageStats} loading={statsLoading} />
       <div className="space-y-2">
         <div className="px-4 flex items-center justify-between">
           <div>
