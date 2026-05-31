@@ -1,4 +1,4 @@
-import React, { useMemo } from "react";
+import React, { useEffect, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import type { DailyWordCount, HistoryUsageStats } from "@/bindings";
 import { SettingsGroup } from "@/components/ui/SettingsGroup";
@@ -49,6 +49,7 @@ export const HistoryUsageStatsPanel: React.FC<HistoryUsageStatsPanelProps> = ({
   loading,
 }) => {
   const { t, i18n } = useTranslation();
+  const heatmapScrollRef = useRef<HTMLDivElement>(null);
 
   const weekdayFormatter = useMemo(
     () =>
@@ -126,6 +127,15 @@ export const HistoryUsageStatsPanel: React.FC<HistoryUsageStatsPanelProps> = ({
   );
 
   const recentWeeks = stats?.weekly_word_counts ?? [];
+
+  useEffect(() => {
+    const scrollContainer = heatmapScrollRef.current;
+    if (!scrollContainer) {
+      return;
+    }
+
+    scrollContainer.scrollLeft = scrollContainer.scrollWidth;
+  }, [stats?.today, weeks.length]);
 
   return (
     <SettingsGroup
@@ -226,7 +236,7 @@ export const HistoryUsageStatsPanel: React.FC<HistoryUsageStatsPanelProps> = ({
             </div>
           </div>
 
-          <div className="overflow-x-auto pb-1">
+          <div ref={heatmapScrollRef} className="overflow-x-auto pb-1">
             <div className="inline-flex min-w-max flex-col gap-2">
               <div className="ml-12 grid gap-1" style={{ gridTemplateColumns: `repeat(${weeks.length}, minmax(0, 1fr))` }}>
                 {monthLabels.map((label, index) => (
